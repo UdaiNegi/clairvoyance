@@ -10,6 +10,7 @@ This module contains the business logic for authentication operations:
 
 from datetime import datetime, timedelta, timezone
 
+import jwt as pyjwt
 from fastapi import HTTPException, status
 
 from app.api.security.breeze_buddy.rbac_token import rbac_token_manager
@@ -17,8 +18,9 @@ from app.core.config.static import (
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from app.core.logger import logger
-from app.core.security.password import verify_password
+from app.core.security.password import DUMMY_PASSWORD_HASH, verify_password
 from app.core.security.scope import resolve_merchant_ids, resolve_reseller_ids
+from app.core.security.token_revocation import revoke_token
 from app.database.accessor.breeze_buddy.users import get_user_by_username
 from app.schemas import (
     LoginRequest,
@@ -125,7 +127,10 @@ async def login_handler(
             expires_in=expires_in,
         )
 
-    # Authentication failed
+    # Authentication failed: no such user. Still spend one bcrypt against a
+    # dummy hash so an unknown username can't be distinguished from a wrong
+    # password by response timing (username-enumeration oracle, PT-16).
+    verify_password(login_request.password, DUMMY_PASSWORD_HASH)
     logger.warning(f"Failed login attempt for unknown user: {login_request.username}")
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -157,6 +162,10 @@ async def generate_s2s_token_handler(request: S2STokenRequest) -> S2STokenRespon
     # Authenticate user
     user = await get_user_by_username(request.username)
     if not user:
+        # Spend one bcrypt against a dummy hash before failing so an unknown
+        # username is timing-indistinguishable from a wrong password — this path
+        # would otherwise reveal whether an admin account exists (PT-16).
+        verify_password(request.password, DUMMY_PASSWORD_HASH)
         logger.warning(f"S2S token request failed: user not found - {request.username}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
@@ -278,27 +287,34 @@ async def get_user_info_handler(current_user: UserInfo) -> UserInfo:
     return current_user
 
 
-async def logout_handler() -> dict:
+async def logout_handler(token: str) -> dict:
     """
     Handle logout for JWT token-based authentication.
 
-    Since JWT tokens are stateless and stored client-side:
-    - Backend cannot invalidate the token (no session to destroy)
-    - Client must delete the token from localStorage/cookies
-    - Token will naturally expire after its lifetime
+    The token is added to the server-side revocation denylist (keyed by a hash
+    of the token, with a TTL equal to its remaining lifetime), so it can no
+    longer authenticate even though its signature is still valid (PT-22).
 
     Returns:
-        Success message with logout instructions
+        Success message.
     """
-    logger.info("Logout endpoint called (token-based auth - client-side logout)")
+    try:
+        payload = pyjwt.decode(
+            token,
+            rbac_token_manager.jwt_manager.secret_key,
+            algorithms=[rbac_token_manager.jwt_manager.algorithm],
+            options={"verify_exp": False},
+        )
+        exp = int(payload.get("exp", 0))
+        revoked = await revoke_token(token, exp)
+    except Exception as e:
+        logger.error(f"Logout: failed to revoke token: {e}")
+        revoked = False
+
+    logger.info(f"Logout endpoint called (token revoked={revoked})")
 
     return {
         "success": True,
-        "message": "Logout acknowledged. Client should clear token from storage.",
-        "instructions": {
-            "step_1": "Remove token from localStorage or cookies",
-            "step_2": "Clear user state in your application",
-            "step_3": "Redirect to login page",
-            "note": "Token remains valid until expiration but client discards it",
-        },
+        "message": "Logout successful. Token has been revoked server-side.",
+        "revoked": revoked,
     }

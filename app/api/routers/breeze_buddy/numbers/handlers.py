@@ -21,6 +21,8 @@ from app.schemas import (
     UserInfo,
 )
 
+from .rbac import validate_number_access
+
 
 async def create_number_handler(
     number: CreateOutboundNumberRequest, current_user: UserInfo
@@ -146,6 +148,15 @@ async def get_number_handler(number_id: str, current_user: UserInfo) -> Outbound
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Outbound number {number_id} not found",
             )
+
+        # Enforce ownership — previously any authenticated user could read any
+        # tenant's number by ID (PT-13 IDOR).
+        validate_number_access(
+            current_user,
+            number.reseller_id,
+            number.merchant_id,
+            operation="access outbound number",
+        )
 
         return number
 

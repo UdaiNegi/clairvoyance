@@ -122,6 +122,62 @@ async def get_user_in_db_by_id(user_id: str) -> Optional[UserInDB]:
         raise
 
 
+# Short-lived cache so the per-request liveness recheck (PT-22) is not a DB
+# round-trip on every authenticated call. Write-through invalidation on
+# update/delete makes disabling an account take effect immediately.
+_USER_ACTIVE_CACHE_TTL = 30
+_USER_ACTIVE_CACHE_PREFIX = "user_active:"
+
+
+async def is_user_active(user_id: str) -> bool:
+    """Return whether a user exists and is active.
+
+    Cached in Redis for a few seconds. Fails OPEN (returns True) on Redis/DB
+    errors so an infra blip does not lock out every authenticated request — the
+    revocation denylist remains the hard-stop for compromised tokens.
+    """
+    cache_key = f"{_USER_ACTIVE_CACHE_PREFIX}{user_id}"
+    try:
+        from app.services.redis.client import get_redis_service
+
+        redis = await get_redis_service()
+        cached = await redis.get(cache_key)
+        if cached is not None:
+            return cached == "1"
+    except Exception as e:
+        logger.error(f"user-active cache read failed for {user_id}: {e}")
+
+    try:
+        user = await get_user_in_db_by_id(user_id)
+        active = bool(user and user.is_active)
+    except Exception as e:
+        logger.error(f"user-active DB lookup failed for {user_id} (failing open): {e}")
+        return True
+
+    try:
+        from app.services.redis.client import get_redis_service
+
+        redis = await get_redis_service()
+        await redis.setex(
+            cache_key, "1" if active else "0", ttl_seconds=_USER_ACTIVE_CACHE_TTL
+        )
+    except Exception as e:
+        logger.error(f"user-active cache write failed for {user_id}: {e}")
+
+    return active
+
+
+async def invalidate_user_active_cache(user_id: str) -> None:
+    """Drop the cached liveness flag so a status change takes effect at once."""
+    try:
+        from app.services.redis.client import get_redis_service
+
+        redis = await get_redis_service()
+        await redis.delete(f"{_USER_ACTIVE_CACHE_PREFIX}{user_id}")
+    except Exception as e:
+        logger.error(f"user-active cache invalidation failed for {user_id}: {e}")
+
+
 async def create_merchant_and_user_atomically(
     *,
     merchant_id: str,
@@ -405,6 +461,10 @@ async def update_user(
 
             if row:
                 logger.info(f"Updated user: {user_id}")
+                if is_active is not None:
+                    # Status changed — drop the liveness cache so a disable
+                    # takes effect on the very next request (PT-22).
+                    await invalidate_user_active_cache(user_id)
                 return decode_user(row)
 
             return None
@@ -434,6 +494,8 @@ async def delete_user(user_id: str) -> bool:
 
         if row:
             logger.info(f"Deleted user: {user_id}")
+            # Cut off any outstanding tokens for the deleted user immediately.
+            await invalidate_user_active_cache(user_id)
             return True
 
         check_query = "SELECT role FROM users WHERE id = $1"

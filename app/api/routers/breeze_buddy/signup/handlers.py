@@ -51,7 +51,7 @@ from app.core.config.static import (
     SELF_SIGNUP_RESELLER_ID,
 )
 from app.core.logger import logger
-from app.core.security.password import verify_password
+from app.core.security.password import DUMMY_PASSWORD_HASH, verify_password
 from app.core.security.scope import resolve_merchant_ids, resolve_reseller_ids
 from app.database.accessor.breeze_buddy import (
     merchants as merchant_accessors,
@@ -398,17 +398,20 @@ async def google_signup_handler(request: GoogleMerchantSignupRequest) -> TokenRe
 async def list_accounts_handler(
     id_token: str | None,
     email: str | None,
+    password: str | None = None,
 ) -> list:
     """
-    Return all user accounts that share a given email address.
+    Return the user accounts that share a given email address.
 
-    Called immediately after Google OAuth or password auth succeeds to
-    give the frontend a list of accounts the user can pick from.
+    Called immediately after Google OAuth or password auth to give the
+    frontend a list of accounts the user can pick from.
 
-    For Google flows: pass `id_token` — the backend verifies it and
-    extracts the email.
-    For password flows: pass `email` directly (already verified by the
-    login handler upstream, so no re-auth needed here).
+    For Google flows: pass `id_token` — the backend verifies it.
+    For password flows: pass `email` AND `password`. The password is
+    verified here so this endpoint cannot be used anonymously to enumerate
+    accounts / PII by email (PT-16). Only accounts whose password matches
+    are returned; any failure yields an identical generic 401 so registration
+    status is not disclosed.
     """
     if id_token:
         claims = _verify_google_id_token(id_token)
@@ -418,15 +421,38 @@ async def list_accounts_handler(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Google account does not have an email address.",
             )
-    elif email:
-        resolved_email = email
+        users = await user_accessors.get_users_by_email(resolved_email)
+        matched = [u for u in users if u.is_active]
+    elif email and password:
+        # Fetch unconditionally so an unregistered email takes the same code
+        # path/timing as a registered one with a wrong password. Always run at
+        # least one bcrypt verification: an empty result set would otherwise
+        # skip the comprehension entirely and return near-instantly, leaking
+        # (via response timing) whether the email is registered (PT-16).
+        users = await user_accessors.get_users_by_email(email)
+        if not users:
+            verify_password(password, DUMMY_PASSWORD_HASH)
+        matched = [
+            u
+            for u in users
+            # Substitute the dummy hash for any user missing a password hash so
+            # such an account can never match and never triggers an error path
+            # (defensive: password_hash is NOT NULL today, so this is unreached).
+            if u.is_active
+            and verify_password(password, u.password_hash or DUMMY_PASSWORD_HASH)
+            and u.password_hash
+        ]
+        if not matched:
+            logger.warning(f"Failed account-list attempt for email: {email}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password.",
+            )
     else:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Either id_token or email must be provided.",
+            detail="Provide either id_token, or email together with password.",
         )
-
-    users = await user_accessors.get_users_by_email(resolved_email)
 
     return [
         AccountSummary(
@@ -438,8 +464,7 @@ async def list_accounts_handler(
             reseller_ids=u.reseller_ids,
             is_active=u.is_active,
         )
-        for u in users
-        if u.is_active
+        for u in matched
     ]
 
 

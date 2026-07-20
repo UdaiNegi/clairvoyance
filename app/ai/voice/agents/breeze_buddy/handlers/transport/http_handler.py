@@ -21,6 +21,7 @@ Uses the same resolution pattern as hooks:
 
 import json
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 from app.ai.voice.agents.breeze_buddy.handlers.transport.http_requester import (
     HttpRequestExecutor,
@@ -103,6 +104,30 @@ async def http_function_handler(
                 "status": "error",
                 "error": f"Missing required arguments: {', '.join(missing_args)}",
             }, None
+
+        # SECURITY: never let an LLM-chosen value determine the URL *host* — a
+        # prompt-injected argument in the host position is an SSRF primitive on
+        # any channel (PT-17). Placeholders in the path/query are fine; the host
+        # is not. Checked against the raw (unresolved) URL template.
+        host_part = urlparse(config.http_request.url or "").netloc
+        for field_name, field_cfg in config.expected_fields.items():
+            if field_cfg.source != FieldSource.LLM:
+                continue
+            arg_name = field_cfg.value or field_name
+            if f"{{{field_name}}}" in host_part or (
+                arg_name and f"{{{arg_name}}}" in host_part
+            ):
+                logger.error(
+                    f"[{function_name}] LLM-sourced field '{field_name}' used in "
+                    "URL host position — refusing"
+                )
+                return {
+                    "status": "error",
+                    "error": (
+                        "Template misconfiguration: an LLM-sourced field cannot "
+                        "be used in the URL host."
+                    ),
+                }, None
 
         # Step 1: Resolve expected_fields using FieldResolver
         resolver = FieldResolver(context=context, args=args)
