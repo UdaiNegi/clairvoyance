@@ -1,10 +1,12 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.ai.voice.agents.breeze_buddy.chat.cleanup import end_idle_chat_sessions
@@ -31,6 +33,7 @@ from app.ai.voice.agents.breeze_buddy.tts.dragontts.monitor import (
 
 # Database imports
 from app.ai.voice.llm._pools import close_all_pools as close_llm_http_pools
+from app.ai.voice.tts.catalog import get_enabled_voices as load_tts_voice_catalog
 from app.api.routers import breeze_buddy, devcycle, feature_flags, systems
 from app.api.routers.breeze_buddy.chat import cancel_bus as chat_cancel_bus
 
@@ -57,6 +60,7 @@ from app.core.config.static import (
     HOST,
     POD_ROLE,
     PORT,
+    TTS_PREVIEW_STORAGE,
 )
 
 # Import necessary components from the new structure
@@ -67,6 +71,7 @@ from app.services.knowledge_base import (
     process_pending_documents as process_pending_kb_documents,
 )
 from app.services.langfuse.tasks.task import initialize_langfuse_tasks
+from app.services.preview_storage import LOCAL_PREVIEW_DIR
 from app.services.redis import (
     close_redis_connections,
     get_redis_service,
@@ -109,6 +114,22 @@ async def lifespan(_app: FastAPI):
         await chat_cancel_bus.start_subscriber()
     except Exception as e:
         logger.error(f"Failed to start chat cancel-bus subscriber: {e}")
+
+    # TTS voice catalog startup: parse/validate catalog.json (always) and, in
+    # local preview-storage mode only, create the served directory. Each
+    # touches the filesystem, so they run here (in a thread) instead of at
+    # module import.
+    # Deliberately NOT wrapped in try/except like the external services above:
+    # catalog.json is checked-in code, so a broken file is a bad build that
+    # must fail deployment — swallowing it would serve 500s per request
+    # instead (lru_cache doesn't memoize exceptions, so the failed load would
+    # also retry blocking disk I/O on the event loop for every call).
+    def _prepare_tts_catalog() -> None:
+        load_tts_voice_catalog()
+        if TTS_PREVIEW_STORAGE == "local":
+            os.makedirs(LOCAL_PREVIEW_DIR, exist_ok=True)
+
+    await asyncio.to_thread(_prepare_tts_catalog)
 
     # DevCycle feature flags are initialized by parent process (run.py) before uvicorn starts
     # Worker processes only need to read from Redis using get_config()
@@ -355,6 +376,17 @@ app.include_router(
 
 # System health endpoints
 app.include_router(systems.router, prefix="", tags=["Systems"])
+
+# TTS voice catalog preview storage — local mode only. GCS mode serves
+# previews straight from the bucket's public URL, no app-side route needed.
+# check_dir=False defers directory existence to the lifespan makedirs above,
+# keeping filesystem I/O out of module import.
+if TTS_PREVIEW_STORAGE == "local":
+    app.mount(
+        "/tts-previews",
+        StaticFiles(directory=LOCAL_PREVIEW_DIR, check_dir=False),
+        name="tts-previews",
+    )
 
 
 # Root endpoint - health check

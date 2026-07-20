@@ -44,6 +44,25 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
 GCS_CREDENTIALS_JSON = os.environ.get("GCS_CREDENTIALS_JSON", "")
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "atoms-sdk")
 
+# TTS Voice Catalog — preview storage. Separate from GCS_BUCKET above (which
+# is the recordings bucket) so previews can live in their own bucket.
+# Validated at import so a misconfigured pod fails at startup, not with
+# permanent 404 preview URLs at runtime.
+TTS_PREVIEW_STORAGE = os.environ.get("TTS_PREVIEW_STORAGE", "local")  # 'gcs' | 'local'
+TTS_PREVIEW_GCS_BUCKET = os.environ.get("TTS_PREVIEW_GCS_BUCKET", "")
+TTS_PREVIEW_PUBLIC_BASE_URL = os.environ.get("TTS_PREVIEW_PUBLIC_BASE_URL", "")
+if TTS_PREVIEW_STORAGE not in ("local", "gcs"):
+    raise RuntimeError(
+        f"TTS_PREVIEW_STORAGE must be 'local' or 'gcs', got {TTS_PREVIEW_STORAGE!r}"
+    )
+if TTS_PREVIEW_STORAGE == "gcs" and not (
+    TTS_PREVIEW_GCS_BUCKET and TTS_PREVIEW_PUBLIC_BASE_URL
+):
+    raise RuntimeError(
+        "TTS_PREVIEW_STORAGE='gcs' requires both TTS_PREVIEW_GCS_BUCKET and "
+        "TTS_PREVIEW_PUBLIC_BASE_URL to be set"
+    )
+
 ENABLE_AIC_FILTER = os.environ.get("ENABLE_AIC_FILTER", "false").lower() == "true"
 AIC_LICENSE_KEY = os.environ.get("AIC_LICENSE_KEY", "")
 # Breeze Buddy AIC License Key

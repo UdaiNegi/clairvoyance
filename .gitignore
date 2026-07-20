@@ -58,3 +58,6 @@ CLAUDE.local.md
 
 # Local scratch / test fixtures
 temp/
+
+# Local-mode TTS preview storage (var/tts-previews/)
+var/
