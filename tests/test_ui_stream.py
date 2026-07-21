@@ -412,3 +412,98 @@ def test_summarize_handles_unknown_type_gracefully():
     ]
     out = summarize_ui_ops(ops)
     assert "1 FutureThingy" in out
+
+
+# ---------------------------------------------------------------------------
+# Recovery of BARE op-lines emitted WITHOUT the <ui_stream> wrapper
+# ---------------------------------------------------------------------------
+#
+# The LLM stochastically forgets to wrap its SpecStream ops. Without recovery
+# those lines leak to the user as raw JSON. The extractor now routes a bare
+# op-line into the same JsonlOpLine path a wrapped line takes, so it renders as
+# UI; genuine prose is untouched and still streams smoothly.
+
+
+def _feed_all(deltas):
+    """Feed each delta then flush; return the flat list of yielded items."""
+    ex = UiStreamExtractor()
+    out: list = []
+    for d in deltas:
+        out.extend(ex.feed(d))
+    out.extend(ex.flush())
+    return out
+
+
+def test_bare_op_lines_recovered_as_op_not_prose():
+    items = _feed_all(
+        [
+            '{"+":"root:Card@root"}\n',
+            '{"+":"t:Text@root","text":"hi"}\n',
+        ]
+    )
+    assert all(isinstance(i, JsonlOpLine) for i in items)
+    assert items[0].raw == '{"+":"root:Card@root"}'
+    assert items[1].raw == '{"+":"t:Text@root","text":"hi"}'
+
+
+def test_verbose_bare_op_line_recovered():
+    items = _feed_all(['{"op":"add","id":"r","type":"Stack"}\n'])
+    assert len(items) == 1 and isinstance(items[0], JsonlOpLine)
+
+
+def test_prose_is_never_recovered_as_op():
+    items = _feed_all(["Here are the cheapest days to fly.\n"])
+    assert items == [TextOut(value="Here are the cheapest days to fly.\n")]
+
+
+def test_prose_with_braces_stays_prose():
+    # Looks jsonish but has no op marker → must remain visible prose.
+    items = _feed_all(['{"note":"not an op"}\n'])
+    assert len(items) == 1 and isinstance(items[0], TextOut)
+
+
+def test_bare_op_line_split_across_deltas_is_recovered():
+    items = _feed_all(['{"+":"root:', 'Card@root","variant":"hi', 'ghlighted"}\n'])
+    assert len(items) == 1 and isinstance(items[0], JsonlOpLine)
+    assert items[0].raw == '{"+":"root:Card@root","variant":"highlighted"}'
+
+
+def test_mixed_prose_then_bare_ops():
+    items = _feed_all(
+        [
+            "Best deal below:\n",
+            '{"+":"c:Card@root"}\n',
+            '{"+":"t:Text@c","text":"IndiGo"}\n',
+        ]
+    )
+    kinds = [type(i).__name__ for i in items]
+    assert kinds == ["TextOut", "JsonlOpLine", "JsonlOpLine"]
+    assert items[0].value == "Best deal below:\n"
+
+
+def test_final_bare_op_line_without_newline_recovered_on_flush():
+    # No trailing newline — must still be recovered (not leaked) at flush.
+    items = _feed_all(['{"+":"root:Card@root"}'])
+    assert len(items) == 1 and isinstance(items[0], JsonlOpLine)
+
+
+def test_wrapped_ops_still_work_after_recovery_change():
+    # Regression: the explicit <ui_stream> path is unchanged.
+    items = _feed_all(
+        [
+            "here <ui_stream>\n",
+            '{"op":"add","id":"root","type":"Stack"}\n',
+            "</ui_stream> done",
+        ]
+    )
+    kinds = [type(i).__name__ for i in items]
+    assert kinds == ["TextOut", "JsonlOpLine", "TextOut"]
+    assert items[0].value == "here "
+    assert items[2].value == " done"
+
+
+def test_prose_streams_immediately_without_newline():
+    # A prose delta with no newline must emit right away (no buffering stall).
+    ex = UiStreamExtractor()
+    out = list(ex.feed("streaming prose no newline yet"))
+    assert out == [TextOut(value="streaming prose no newline yet")]

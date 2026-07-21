@@ -41,6 +41,35 @@ _OPEN = "<ui_stream>"
 _CLOSE = "</ui_stream>"
 _CARRY_MAX = max(len(_OPEN), len(_CLOSE)) - 1
 
+# Compact op markers ("+" add / "~" replace / "-" remove) and the verbose
+# ``{"op": ...}`` verbs. Used to recognize a bare SpecStream op-line the LLM
+# emitted WITHOUT the ``<ui_stream>`` wrapper, so it can be recovered into the
+# op path instead of leaking to the user as raw JSON. See ``_is_op_line``.
+_OP_MARKERS: Set[str] = {"+", "~", "-"}
+_OP_VERBS: Set[str] = {"add", "replace", "remove"}
+
+
+def _is_op_line(text: str) -> bool:
+    """True iff ``text`` is a bare SpecStream op-line.
+
+    Conservative on purpose: the line must parse to a JSON **object** carrying
+    an op marker (compact ``{"+"|"~"|"-": …}`` or verbose
+    ``{"op": "add"|"replace"|"remove", …}``). Ordinary prose — even prose that
+    contains braces or a stray JSON value — never matches, so nothing that
+    isn't genuinely UI gets diverted out of the visible reply.
+    """
+    if not text.startswith("{"):
+        return False
+    try:
+        obj = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(obj, dict):
+        return False
+    if _OP_MARKERS & obj.keys():
+        return True
+    return obj.get("op") in _OP_VERBS
+
 
 # ---------------------------------------------------------------------------
 # Streaming items
@@ -91,6 +120,10 @@ class UiStreamExtractor:
         self._carry: str = ""
         # Partial JSONL line accumulator (active while INSIDE).
         self._line_buf: str = ""
+        # OUTSIDE accumulator: holds only a pending line that STARTS with "{"
+        # (a possible bare op-line) until a newline decides op-vs-prose. Prose
+        # never sits here — it streams immediately — so smoothness is preserved.
+        self._out_line_buf: str = ""
 
     def feed(self, delta: str) -> Iterator[YieldItem]:
         """Process one text delta. Yields zero or more text/op_line items."""
@@ -108,9 +141,14 @@ class UiStreamExtractor:
         ``<ui_stream>`` but never closed it.
         """
         if self._state == "OUTSIDE":
-            if self._carry:
-                yield TextOut(value=self._carry)
+            # A held partial op-line (no trailing newline) + any marker-prefix
+            # carry. Route through the op recogniser so a wrapper-less final op
+            # is recovered rather than leaked; anything else falls back to prose.
+            leftover = self._out_line_buf + self._carry
+            self._out_line_buf = ""
             self._carry = ""
+            if leftover:
+                yield from self._emit_outside_line(leftover)
             return
         partial = self._line_buf + self._carry
         _log.warning(
@@ -128,18 +166,19 @@ class UiStreamExtractor:
             if self._state == "OUTSIDE":
                 idx = buffer.find(_OPEN)
                 if idx != -1:
-                    if idx > 0:
-                        yield TextOut(value=buffer[:idx])
+                    # Definite boundary before the open marker — flush any held
+                    # partial op-line too, then switch INSIDE.
+                    yield from self._emit_outside(buffer[:idx], flush_partial=True)
                     buffer = buffer[idx + len(_OPEN) :]
                     self._state = "INSIDE"
                     continue
                 hold = _tail_marker_prefix(buffer, _OPEN)
                 if hold:
-                    if len(buffer) > hold:
-                        yield TextOut(value=buffer[:-hold])
+                    body = buffer[:-hold] if len(buffer) > hold else ""
+                    yield from self._emit_outside(body, flush_partial=False)
                     self._carry = buffer[-hold:]
                 else:
-                    yield TextOut(value=buffer)
+                    yield from self._emit_outside(buffer, flush_partial=False)
                     self._carry = ""
                 return
 
@@ -177,6 +216,50 @@ class UiStreamExtractor:
             if line:
                 yield JsonlOpLine(raw=line)
             buffer = buffer[newline_idx + 1 :]
+
+    def _emit_outside(self, text: str, flush_partial: bool) -> Iterator[YieldItem]:
+        """Emit OUTSIDE (non-block) text, recovering a bare op-line the LLM
+        forgot to wrap in ``<ui_stream>``.
+
+        Prose streams immediately for smoothness; only a line that *starts*
+        with ``{`` is held (until its newline) so we can decide op-vs-prose. A
+        recovered op-line is yielded as ``JsonlOpLine`` — the same item a
+        wrapped line produces — so it flows through the identical heal/render
+        path and shows as UI instead of leaking as raw JSON. ``flush_partial``
+        forces a held partial line out (used when a definite ``<ui_stream>``
+        boundary follows).
+        """
+        self._out_line_buf += text
+        while self._out_line_buf:
+            starts_brace = self._out_line_buf.lstrip().startswith("{")
+            newline_idx = self._out_line_buf.find("\n")
+            if not starts_brace:
+                # Definitely prose — stream up to the newline, or all of it.
+                if newline_idx == -1:
+                    yield TextOut(value=self._out_line_buf)
+                    self._out_line_buf = ""
+                    return
+                yield TextOut(value=self._out_line_buf[: newline_idx + 1])
+                self._out_line_buf = self._out_line_buf[newline_idx + 1 :]
+                continue
+            # Might be a bare op-line — need the whole line to know.
+            if newline_idx == -1:
+                if flush_partial:
+                    yield from self._emit_outside_line(self._out_line_buf)
+                    self._out_line_buf = ""
+                return
+            line = self._out_line_buf[: newline_idx + 1]
+            self._out_line_buf = self._out_line_buf[newline_idx + 1 :]
+            yield from self._emit_outside_line(line)
+
+    def _emit_outside_line(self, line: str) -> Iterator[YieldItem]:
+        """Classify one OUTSIDE line: a bare op-line is recovered as a
+        ``JsonlOpLine`` (so it renders); anything else is prose (``TextOut``)."""
+        stripped = line.strip()
+        if _is_op_line(stripped):
+            yield JsonlOpLine(raw=stripped)
+        elif line:
+            yield TextOut(value=line)
 
 
 def _tail_marker_prefix(buffer: str, marker: str) -> int:
