@@ -74,6 +74,7 @@ def _active_session():
         current_node="start",
         template_id="t1",
         metadata={"template_vars": {}},
+        merchant_id="m1",
     )
 
 

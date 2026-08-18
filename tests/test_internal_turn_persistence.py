@@ -290,6 +290,7 @@ async def _drive_run_chat_turn(monkeypatch, *, internal: bool) -> Dict[str, Any]
             template_id="tpl-1",
             metadata={},
             current_node=None,
+            merchant_id="m1",
         )
 
     async def _get_template(_tid):
