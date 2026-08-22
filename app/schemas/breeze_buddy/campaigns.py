@@ -9,7 +9,13 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+MAX_CAMPAIGN_LEADS = 5000
+MAX_CAMPAIGN_LEADS_ERROR = (
+    f"Campaign upload is limited to {MAX_CAMPAIGN_LEADS} leads per request; "
+    "split the file into smaller batches"
+)
 
 
 class CampaignStatus(str, Enum):
@@ -34,7 +40,16 @@ class CreateCampaignRequest(BaseModel):
     template_id: str
     reseller_id: str
     merchant_id: Optional[str] = None
-    leads: List[CampaignLeadInput] = Field(..., min_length=1, max_length=1000)
+    leads: List[CampaignLeadInput] = Field(..., min_length=1)
+
+    @field_validator("leads")
+    @classmethod
+    def leads_within_batch_ceiling(
+        cls, leads: List[CampaignLeadInput]
+    ) -> List[CampaignLeadInput]:
+        if len(leads) > MAX_CAMPAIGN_LEADS:
+            raise ValueError(MAX_CAMPAIGN_LEADS_ERROR)
+        return leads
 
 
 class CampaignLeadError(BaseModel):
